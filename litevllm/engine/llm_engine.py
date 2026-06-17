@@ -1,3 +1,4 @@
+import warnings
 from dataclasses import fields
 from time import perf_counter
 
@@ -14,13 +15,26 @@ from litevllm.sampling_params import SamplingParams
 class LLMEngine:
     def __init__(self, model: str, **kwargs):
         config_fields = {field.name for field in fields(Config)}
-        config_kwargs = {key: value for key, value in kwargs.items() if key in config_fields}
-        self.config = Config(model, **config_kwargs)
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            self.config.model,
-            use_fast=True,
-            trust_remote_code=self.config.trust_remote_code,
-        )
+        known = {k: v for k, v in kwargs.items() if k in config_fields}
+        unknown = [k for k in kwargs if k not in config_fields]
+        if unknown:
+            warnings.warn(
+                f"LLMEngine: ignoring unknown kwargs {unknown}; "
+                f"valid Config fields are {sorted(config_fields)}",
+                stacklevel=2,
+            )
+        self.config = Config(model, **known)
+        try:
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                self.config.model,
+                use_fast=True,
+                trust_remote_code=self.config.trust_remote_code,
+            )
+        except OSError as exc:
+            raise RuntimeError(
+                f"Failed to load tokenizer from '{self.config.model}'. "
+                "Ensure the directory contains tokenizer.json / tokenizer.model."
+            ) from exc
         if self.tokenizer.pad_token_id is None and self.tokenizer.eos_token_id is not None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
         self.config.eos = self.tokenizer.eos_token_id if self.tokenizer.eos_token_id is not None else -1
@@ -57,14 +71,20 @@ class LLMEngine:
             self.add_request(prompt, params)
 
         outputs: dict[int, list[int]] = {}
+        total_tokens = 0
         pbar = tqdm(total=len(prompts), desc="Generating", dynamic_ncols=True, disable=not use_tqdm)
+        started_all = perf_counter()
         while not self.is_finished():
-            started = perf_counter()
+            step_started = perf_counter()
             finished = self.step()
+            total_tokens += len(finished) or 1  # count at least one step
             for seq_id, token_ids in finished:
                 outputs[seq_id] = token_ids
                 pbar.update(1)
-            pbar.set_postfix({"step_s": f"{perf_counter() - started:.3f}"})
+            pbar.set_postfix_str(
+                f"step_ms={1000 * (perf_counter() - step_started):.1f} "
+                f"tok/s={total_tokens / max(perf_counter() - started_all, 1e-6):.1f}"
+            )
         pbar.close()
 
         return [

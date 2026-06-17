@@ -9,7 +9,7 @@ class Scheduler:
         self.max_num_seqs = config.max_num_seqs
         self.eos = config.eos
         self.waiting: deque[Sequence] = deque()
-        self.running: deque[Sequence] = deque()
+        self.running: list[Sequence] = []
 
     def add(self, seq: Sequence) -> None:
         self.waiting.append(seq)
@@ -18,8 +18,9 @@ class Scheduler:
         return not self.waiting and not self.running
 
     def schedule(self) -> tuple[list[Sequence], bool]:
+        self.running = [s for s in self.running if s.status == SequenceStatus.RUNNING]
         prefill: list[Sequence] = []
-        while self.waiting and len(self.running) + len(prefill) < self.max_num_seqs:
+        while self.waiting and len(self.running) < self.max_num_seqs:
             seq = self.waiting.popleft()
             seq.status = SequenceStatus.RUNNING
             self.running.append(seq)
@@ -35,4 +36,3 @@ class Scheduler:
             hit_limit = seq.num_completion_tokens >= seq.max_tokens
             if hit_eos or hit_limit:
                 seq.status = SequenceStatus.FINISHED
-                self.running.remove(seq)

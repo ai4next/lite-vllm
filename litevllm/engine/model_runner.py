@@ -17,7 +17,13 @@ class ModelRunner:
             kwargs["torch_dtype"] = getattr(torch, config.dtype)
         elif self.device.type == "cuda":
             kwargs["torch_dtype"] = torch.float16
-        self.model = AutoModelForCausalLM.from_pretrained(config.model, **kwargs).to(self.device)
+        try:
+            self.model = AutoModelForCausalLM.from_pretrained(config.model, **kwargs).to(self.device)
+        except OSError as exc:
+            raise RuntimeError(
+                f"Failed to load model weights from '{config.model}'. "
+                "Verify model.safetensors / pytorch_model.bin are present."
+            ) from exc
         self.model.eval()
 
     @torch.inference_mode()
@@ -28,6 +34,49 @@ class ModelRunner:
         lengths = attention_mask.sum(dim=1) - 1
         logits = outputs.logits[torch.arange(len(seqs), device=self.device), lengths]
         return self._sample(logits, seqs).tolist()
+
+    def _sample(self, logits: torch.Tensor, seqs: list[Sequence]) -> torch.Tensor:
+        temperatures = torch.tensor(
+            [seq.temperature for seq in seqs],
+            dtype=torch.float32, device=logits.device,
+        ).unsqueeze(1)
+        greedy = temperatures.squeeze(1) == 0
+        safe_temperatures = temperatures.clamp_min(1e-6)
+        scores = logits.float() / safe_temperatures
+        scores = self._apply_top_k_top_p(scores, seqs)
+        greedy_ids = logits.argmax(dim=-1)
+        if greedy.all():
+            return greedy_ids
+        probs = torch.softmax(scores, dim=-1)
+        sampled = torch.multinomial(probs, num_samples=1).squeeze(1)
+        return torch.where(greedy, greedy_ids, sampled)
+
+    @staticmethod
+    def _apply_top_k_top_p(scores: torch.Tensor, seqs: list[Sequence]) -> torch.Tensor:
+        B, V = scores.shape
+        device = scores.device
+        sorted_scores, sorted_idx = scores.sort(descending=True, dim=-1)
+        top_ks = torch.tensor(
+            [max(0, min(seq.top_k, V)) for seq in seqs],
+            dtype=torch.long, device=device,
+        ).unsqueeze(1)
+        top_ps = torch.tensor(
+            [seq.top_p for seq in seqs],
+            dtype=torch.float32, device=device,
+        ).unsqueeze(1)
+        positions = torch.arange(V, device=device).unsqueeze(0)
+        topk_valid = top_ks > 0
+        topk_mask = (positions >= top_ks) & topk_valid
+        sorted_scores.masked_fill_(topk_mask, float("-inf"))
+        topp_valid = top_ps < 1.0
+        if topp_valid.any():
+            probs = torch.softmax(sorted_scores, dim=-1)
+            cumsum = torch.cumsum(probs, dim=-1)
+            topp_mask = (cumsum > top_ps) & (positions > 0) & topp_valid
+            sorted_scores.masked_fill_(topp_mask, float("-inf"))
+        result = torch.zeros_like(scores)
+        result.scatter_(1, sorted_idx, sorted_scores)
+        return result
 
     def _batch_inputs(self, seqs: list[Sequence]) -> tuple[torch.Tensor, torch.Tensor]:
         max_len = max(len(seq) for seq in seqs)
@@ -44,30 +93,3 @@ class ModelRunner:
             attention_mask[row, : ids.numel()] = 1
         return input_ids, attention_mask
 
-    def _sample(self, logits: torch.Tensor, seqs: list[Sequence]) -> torch.Tensor:
-        temperatures = torch.tensor([seq.temperature for seq in seqs], dtype=torch.float32, device=logits.device)
-        greedy = temperatures == 0
-        safe_temperatures = temperatures.clamp_min(1e-6).unsqueeze(1)
-        scores = logits.float() / safe_temperatures
-        scores = self._apply_top_k_top_p(scores, seqs)
-        probs = torch.softmax(scores, dim=-1)
-        sampled = torch.multinomial(probs, num_samples=1).squeeze(1)
-        greedy_ids = logits.argmax(dim=-1)
-        return torch.where(greedy, greedy_ids, sampled)
-
-    @staticmethod
-    def _apply_top_k_top_p(scores: torch.Tensor, seqs: list[Sequence]) -> torch.Tensor:
-        filtered = scores.clone()
-        for row, seq in enumerate(seqs):
-            row_scores = filtered[row]
-            if seq.top_k > 0 and seq.top_k < row_scores.numel():
-                kth = torch.topk(row_scores, seq.top_k).values[-1]
-                row_scores[row_scores < kth] = -float("inf")
-            if seq.top_p < 1.0:
-                sorted_scores, sorted_idx = torch.sort(row_scores, descending=True)
-                sorted_probs = torch.softmax(sorted_scores, dim=-1)
-                remove = torch.cumsum(sorted_probs, dim=-1) > seq.top_p
-                remove[1:] = remove[:-1].clone()
-                remove[0] = False
-                row_scores[sorted_idx[remove]] = -float("inf")
-        return filtered
