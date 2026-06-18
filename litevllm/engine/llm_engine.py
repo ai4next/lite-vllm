@@ -7,8 +7,8 @@ from transformers import AutoTokenizer
 
 from litevllm.config import Config
 from litevllm.engine.model_runner import ModelRunner
-from litevllm.engine.scheduler import Scheduler
-from litevllm.engine.sequence import Sequence
+from litevllm.engine.scheduler import ScheduleResult, Scheduler
+from litevllm.engine.sequence import Sequence, SequenceStatus
 from litevllm.sampling_params import SamplingParams
 
 
@@ -43,13 +43,33 @@ class LLMEngine:
 
     def add_request(self, prompt: str | list[int], sampling_params: SamplingParams) -> None:
         token_ids = self.tokenizer.encode(prompt) if isinstance(prompt, str) else prompt
-        self.scheduler.add(Sequence(token_ids, sampling_params))
+        stop_ids = (
+            [self.tokenizer.encode(s, add_special_tokens=False) for s in sampling_params.stop_strings]
+            if sampling_params.stop_strings
+            else []
+        )
+        self.scheduler.add(Sequence(token_ids, sampling_params, stop_string_ids=stop_ids))
 
     def step(self) -> list[tuple[int, list[int]]]:
-        seqs, is_prefill = self.scheduler.schedule()
-        token_ids = self.model_runner.run(seqs, is_prefill)
-        self.scheduler.postprocess(seqs, token_ids)
-        return [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
+        result: ScheduleResult = self.scheduler.schedule()
+        finished: list[Sequence] = []
+
+        # Phase 1: prefill new waiting sequences (if any)
+        if result.prefill:
+            token_ids = self.model_runner.run(result.prefill, is_prefill=True)
+            finished.extend(self.scheduler.postprocess(result.prefill, token_ids))
+
+        # Phase 2: decode running sequences (always run when there are active seqs)
+        # Exclude sequences that finished in the prefill phase.
+        decode_seqs = [
+            s for s in self.scheduler.running
+            if s.status == SequenceStatus.RUNNING
+        ]
+        if decode_seqs:
+            token_ids = self.model_runner.run(decode_seqs, is_prefill=False)
+            finished.extend(self.scheduler.postprocess(decode_seqs, token_ids))
+
+        return [(seq.seq_id, seq.completion_token_ids) for seq in finished]
 
     def is_finished(self) -> bool:
         return self.scheduler.is_finished()

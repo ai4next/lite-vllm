@@ -79,17 +79,20 @@ class ModelRunner:
         return result
 
     def _batch_inputs(self, seqs: list[Sequence]) -> tuple[torch.Tensor, torch.Tensor]:
+        B = len(seqs)
         max_len = max(len(seq) for seq in seqs)
         if max_len > self.config.max_model_len:
             raise ValueError(f"sequence length {max_len} exceeds max_model_len {self.config.max_model_len}")
         pad_id = self.tokenizer.pad_token_id
         if pad_id is None:
             pad_id = self.tokenizer.eos_token_id or 0
-        input_ids = torch.full((len(seqs), max_len), pad_id, dtype=torch.long, device=self.device)
-        attention_mask = torch.zeros((len(seqs), max_len), dtype=torch.long, device=self.device)
+        # Build input_ids directly on device (avoids CPU intermediate tensor).
+        input_ids = torch.full((B, max_len), pad_id, dtype=torch.long, device=self.device)
+        attention_mask = torch.zeros((B, max_len), dtype=torch.long, device=self.device)
         for row, seq in enumerate(seqs):
-            ids = torch.tensor(seq.token_ids, dtype=torch.long, device=self.device)
-            input_ids[row, : ids.numel()] = ids
-            attention_mask[row, : ids.numel()] = 1
+            sl = len(seq)
+            ids_row = torch.as_tensor(seq.token_ids, dtype=torch.long, device=self.device)
+            input_ids[row, :sl] = ids_row
+            attention_mask[row, :sl] = 1
         return input_ids, attention_mask
 

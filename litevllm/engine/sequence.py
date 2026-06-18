@@ -14,7 +14,12 @@ class SequenceStatus(Enum):
 class Sequence:
     counter = count()
 
-    def __init__(self, token_ids: list[int], sampling_params: SamplingParams):
+    def __init__(
+        self,
+        token_ids: list[int],
+        sampling_params: SamplingParams,
+        stop_string_ids: list[list[int]] | None = None,
+    ):
         if not token_ids:
             raise ValueError("prompt must contain at least one token")
         self.seq_id = next(Sequence.counter)
@@ -26,6 +31,7 @@ class Sequence:
         self.top_p = sampling_params.top_p
         self.top_k = sampling_params.top_k
         self.ignore_eos = sampling_params.ignore_eos
+        self.stop_string_ids: list[list[int]] = stop_string_ids or []
 
     def __len__(self) -> int:
         return len(self.token_ids)
@@ -52,3 +58,17 @@ class Sequence:
 
     def append_token(self, token_id: int) -> None:
         self.token_ids.append(int(token_id))
+
+    def check_stop(self) -> bool:
+        """Return True if completion ends with any configured stop string."""
+        if not self.stop_string_ids:
+            return False
+        completion = self.completion_token_ids
+        for stop_ids in self.stop_string_ids:
+            if len(stop_ids) == 0:
+                continue
+            if len(completion) < len(stop_ids):
+                continue
+            if completion[-len(stop_ids) :] == stop_ids:
+                return True
+        return False
