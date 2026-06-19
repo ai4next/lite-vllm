@@ -27,29 +27,60 @@ class ModelRunner:
         self.model.eval()
 
     @torch.inference_mode()
-    def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
-        del is_prefill  # This lite runner recomputes the full context every step.
+    def run(self, seqs: list[Sequence], is_prefill: bool) -> tuple[list[int], list[float]]:
+        del is_prefill
         input_ids, attention_mask = self._batch_inputs(seqs)
         outputs = self.model(input_ids=input_ids, attention_mask=attention_mask)
         lengths = attention_mask.sum(dim=1) - 1
         logits = outputs.logits[torch.arange(len(seqs), device=self.device), lengths]
-        return self._sample(logits, seqs).tolist()
+        return self._sample(logits, seqs)
 
-    def _sample(self, logits: torch.Tensor, seqs: list[Sequence]) -> torch.Tensor:
+    def _sample(self, logits: torch.Tensor, seqs: list[Sequence]) -> tuple[list[int], list[float]]:
+        B = logits.shape[0]
+        device = logits.device
+
+        # Set per-sequence seeds (first seed covers all randomness).
+        seeds = [s.seed for s in seqs]
+        if any(s is not None for s in seeds):
+            torch.manual_seed(seeds[0] if seeds[0] is not None else 0)
+
+        # Repetition penalty applied to all scores (before temperature/greedy).
+        pen = torch.tensor(
+            [s.repetition_penalty for s in seqs], dtype=torch.float32, device=device,
+        ).unsqueeze(1)
+        scores = logits.float()
+        for i, seq in enumerate(seqs):
+            completion = seq.completion_token_ids
+            if completion and pen[i, 0] != 1.0:
+                uniq = torch.tensor(completion, device=device).unique()
+                for token in uniq.tolist():
+                    if token < scores.shape[1]:
+                        if scores[i, token] > 0:
+                            scores[i, token] /= pen[i, 0].item()
+                        else:
+                            scores[i, token] *= pen[i, 0].item()
+
+        # Greedy argmax is computed on penalty-adjusted scores.
+        greedy_ids = scores.argmax(dim=-1)
         temperatures = torch.tensor(
-            [seq.temperature for seq in seqs],
-            dtype=torch.float32, device=logits.device,
+            [s.temperature for s in seqs], dtype=torch.float32, device=device,
         ).unsqueeze(1)
         greedy = temperatures.squeeze(1) == 0
-        safe_temperatures = temperatures.clamp_min(1e-6)
-        scores = logits.float() / safe_temperatures
-        scores = self._apply_top_k_top_p(scores, seqs)
-        greedy_ids = logits.argmax(dim=-1)
+
+        # Top-k / top-p applied to temperature-scaled scores.
+        scaled = scores / temperatures.clamp_min(1e-6)
+        filtered = self._apply_top_k_top_p(scaled, seqs)
+
         if greedy.all():
-            return greedy_ids
-        probs = torch.softmax(scores, dim=-1)
+            return greedy_ids.tolist(), [float("-inf")] * B
+
+        # Log probabilities from filtered scores, then sample.
+        log_probs = torch.log_softmax(filtered, dim=-1)
+        probs = torch.softmax(filtered, dim=-1)
         sampled = torch.multinomial(probs, num_samples=1).squeeze(1)
-        return torch.where(greedy, greedy_ids, sampled)
+        result = torch.where(greedy, greedy_ids, sampled)
+        lp = log_probs[torch.arange(B, device=device), result].tolist()
+        return result.tolist(), lp
 
     @staticmethod
     def _apply_top_k_top_p(scores: torch.Tensor, seqs: list[Sequence]) -> torch.Tensor:

@@ -30,8 +30,12 @@ class Sequence:
         self.max_tokens = sampling_params.max_tokens
         self.top_p = sampling_params.top_p
         self.top_k = sampling_params.top_k
+        self.repetition_penalty = sampling_params.repetition_penalty
+        self.seed = sampling_params.seed
         self.ignore_eos = sampling_params.ignore_eos
         self.stop_string_ids: list[list[int]] = stop_string_ids or []
+        # Log probabilities of each completion token (after prompt).
+        self.logprobs: list[float] = []
 
     def __len__(self) -> int:
         return len(self.token_ids)

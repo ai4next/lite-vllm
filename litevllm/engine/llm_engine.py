@@ -50,26 +50,26 @@ class LLMEngine:
         )
         self.scheduler.add(Sequence(token_ids, sampling_params, stop_string_ids=stop_ids))
 
-    def step(self) -> list[tuple[int, list[int]]]:
+    def step(self) -> list[tuple[int, list[int], list[float]]]:
         result: ScheduleResult = self.scheduler.schedule()
         finished: list[Sequence] = []
 
-        # Phase 1: prefill new waiting sequences (if any)
         if result.prefill:
-            token_ids = self.model_runner.run(result.prefill, is_prefill=True)
-            finished.extend(self.scheduler.postprocess(result.prefill, token_ids))
+            token_ids, logprobs = self.model_runner.run(result.prefill, is_prefill=True)
+            finished.extend(self.scheduler.postprocess(result.prefill, token_ids, logprobs))
 
-        # Phase 2: decode running sequences (always run when there are active seqs)
-        # Exclude sequences that finished in the prefill phase.
         decode_seqs = [
             s for s in self.scheduler.running
             if s.status == SequenceStatus.RUNNING
         ]
         if decode_seqs:
-            token_ids = self.model_runner.run(decode_seqs, is_prefill=False)
-            finished.extend(self.scheduler.postprocess(decode_seqs, token_ids))
+            token_ids, logprobs = self.model_runner.run(decode_seqs, is_prefill=False)
+            finished.extend(self.scheduler.postprocess(decode_seqs, token_ids, logprobs))
 
-        return [(seq.seq_id, seq.completion_token_ids) for seq in finished]
+        return [
+            (seq.seq_id, seq.completion_token_ids, seq.logprobs)
+            for seq in finished
+        ]
 
     def is_finished(self) -> bool:
         return self.scheduler.is_finished()
@@ -90,16 +90,16 @@ class LLMEngine:
         for prompt, params in zip(prompts, sampling_params):
             self.add_request(prompt, params)
 
-        outputs: dict[int, list[int]] = {}
+        outputs: dict[int, dict[str, list[int] | list[float]]] = {}
         total_tokens = 0
         pbar = tqdm(total=len(prompts), desc="Generating", dynamic_ncols=True, disable=not use_tqdm)
         started_all = perf_counter()
         while not self.is_finished():
             step_started = perf_counter()
             finished = self.step()
-            total_tokens += len(finished) or 1  # count at least one step
-            for seq_id, token_ids in finished:
-                outputs[seq_id] = token_ids
+            total_tokens += len(finished) or 1
+            for seq_id, token_ids, logprobs in finished:
+                outputs[seq_id] = {"token_ids": token_ids, "logprobs": logprobs}
                 pbar.update(1)
             pbar.set_postfix_str(
                 f"step_ms={1000 * (perf_counter() - step_started):.1f} "
@@ -108,6 +108,10 @@ class LLMEngine:
         pbar.close()
 
         return [
-            {"text": self.tokenizer.decode(outputs[seq_id], skip_special_tokens=True), "token_ids": outputs[seq_id]}
+            {
+                "text": self.tokenizer.decode(outputs[seq_id]["token_ids"], skip_special_tokens=True),
+                "token_ids": outputs[seq_id]["token_ids"],
+                "logprobs": outputs[seq_id]["logprobs"],
+            }
             for seq_id in sorted(outputs)
         ]

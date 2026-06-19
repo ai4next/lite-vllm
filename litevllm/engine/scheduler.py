@@ -44,10 +44,18 @@ class Scheduler:
 
         return ScheduleResult(prefill=prefill, decode=decode)
 
-    def postprocess(self, seqs: list[Sequence], token_ids: list[int]) -> list[Sequence]:
+    def postprocess(
+        self,
+        seqs: list[Sequence],
+        token_ids: list[int],
+        logprobs: list[float] | None = None,
+    ) -> list[Sequence]:
         finished: list[Sequence] = []
-        for seq, token_id in zip(seqs, token_ids):
+        logprobs = logprobs or [None] * len(seqs)
+        for seq, token_id, lp in zip(seqs, token_ids, logprobs):
             seq.append_token(token_id)
+            if lp is not None:
+                seq.logprobs.append(lp)
             hit_eos = token_id == self.eos and not seq.ignore_eos
             hit_limit = seq.num_completion_tokens >= seq.max_tokens
             hit_stop = seq.check_stop()
